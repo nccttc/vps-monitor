@@ -1,20 +1,5 @@
 #!/usr/bin/env bash
-
-# vps-monitor 安装脚本优化版
-#
-# 功能:
-# - 安装、卸载、重启监控代理 (node_exporter, process-exporter, blackbox_exporter)
-#
-# 优化点:
-# - 增加 'set -euo pipefail' 提高脚本健壮性
-# - 使用函数封装重复代码，提高可读性和可维护性
-# - 增加颜色输出和日志函数，使输出更清晰
-# - 优化系统和架构检测逻辑
-# - 增加对 curl 的支持，并在 wget 不可用时自动切换
-# - 增加下载文件的 SHA256 校验，确保文件完整性和安全性
-# - 使用 mktemp 创建临时目录，避免污染当前目录
-# - 优化 systemd 服务文件的创建过程
-# - 增加更详细的错误处理和提示信息
+# vps-monitor脚本
 
 set -euo pipefail
 
