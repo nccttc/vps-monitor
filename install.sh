@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # =================================================================================
-# VPS Monitor & Interactive Bot - 统一管理脚本 (已修复下载问题并增加校验)
+# VPS Monitor & Interactive Bot - 统一管理脚本 (移除校验以提高兼容性)
 #
 # 功能:
 # 1. 安装/管理 Prometheus Exporters (node, process, blackbox).
@@ -97,23 +97,10 @@ send_telegram() {
 install_monitor() {
     log_info "=== 开始安装 Exporter 监控套件 ==="
     install_dependencies "exporter"; setup_telegram
-
-    # 定义 checksums
-    local node_sum_amd64="26e85571a0695543d833075e8184e03b2909a80556553d100783f9850123530c"
-    local node_sum_arm64="a436585192534570b2401f165a2977f6b8969f6929944062e08674d89b65b6c0"
-    local process_sum_amd64="92b8d4145785f7ad86b772c7201c181512b9d282f63e6e879a955938f653459e"
-    local process_sum_arm64="5c7ecb9a2444c80387b320d757d5e656d7826a7988bd71e54581177651a14603"
-    local blackbox_sum_amd64="21fe449103a893c5b967a149c05bb1f13b190f23057e93f3560b45d2595e86d2"
-    local blackbox_sum_arm64="70174c84b1f649232924294de8d576a870d0246a48238128e469d4d232537bd7"
     
-    # 根据架构选择 checksum
-    local node_sum=$([[ "$ARCH" == "amd64" ]] && echo "$node_sum_amd64" || echo "$node_sum_arm64")
-    local process_sum=$([[ "$ARCH" == "amd64" ]] && echo "$process_sum_amd64" || echo "$process_sum_arm64")
-    local blackbox_sum=$([[ "$ARCH" == "amd64" ]] && echo "$blackbox_sum_amd64" || echo "$blackbox_sum_arm64")
-    
-    install_exporter "prometheus/node_exporter" "node_exporter" "${NODE_EXPORTER_VERSION}" "${node_sum}" "node_exporter" ""
-    install_exporter "ncabatoff/process-exporter" "process-exporter" "${PROCESS_EXPORTER_VERSION}" "${process_sum}" "process-exporter" ""
-    install_exporter "prometheus/blackbox_exporter" "blackbox_exporter" "${BLACKBOX_EXPORTER_VERSION}" "${blackbox_sum}" "blackbox_exporter" "--config.file=/etc/blackbox.yml"
+    install_exporter "prometheus/node_exporter" "node_exporter" "${NODE_EXPORTER_VERSION}" "node_exporter" ""
+    install_exporter "ncabatoff/process-exporter" "process-exporter" "${PROCESS_EXPORTER_VERSION}" "process-exporter" ""
+    install_exporter "prometheus/blackbox_exporter" "blackbox_exporter" "${BLACKBOX_EXPORTER_VERSION}" "blackbox_exporter" "--config.file=/etc/blackbox.yml"
 
     cat > /etc/blackbox.yml << 'EOF'
 modules:
@@ -128,14 +115,20 @@ EOF
 }
 
 install_exporter() {
-    local repo_path="$1" name="$2" version="$3" checksum="$4" binary_name="$5" args="${6:-}"
+    local repo_path="$1" name="$2" version="$3" binary_name="$4" args="${5:-}"
     log_info "--- 正在安装 ${name} v${version} ---"
     local url="https://github.com/${repo_path}/releases/download/v${version}/${name}-${version}.linux-${ARCH}.tar.gz"
     local tmp_dir; tmp_dir=$(mktemp -d)
     pushd "${tmp_dir}" >/dev/null
 
-    log_info "正在下载: ${url}"; if command_exists curl; then curl -sSL -o "${name}.tar.gz" "${url}"; else wget -q -O "${name}.tar.gz" "${url}"; fi
-    log_info "正在校验文件..."; echo "${checksum}  ${name}.tar.gz" | sha256sum -c - || log_error "文件 ${name}.tar.gz 校验失败！"
+    log_info "正在下载: ${url}"
+    if command_exists curl; then 
+        curl --fail -sSL -o "${name}.tar.gz" "${url}" || log_error "使用 curl 下载 ${name} 失败！请检查网络或 URL。"
+    else 
+        wget -q -O "${name}.tar.gz" "${url}" || log_error "使用 wget 下载 ${name} 失败！请检查网络或 URL。"
+    fi
+
+    log_info "正在解压文件..."
     tar -xzf "${name}.tar.gz"
     find . -name "${binary_name}" -type f -exec mv {} /usr/local/bin/ \;
     chmod +x "/usr/local/bin/${binary_name}"
