@@ -1,280 +1,199 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
-# =================================================================================
-# VPS Monitor & Interactive Bot - 统一管理脚本 (移除校验以提高兼容性)
+#================================================================================
+# VPS Monitoring Script with Telegram Alerts
 #
-# 功能:
-# 1. 安装/管理 Prometheus Exporters (node, process, blackbox).
-# 2. 在关键操作后发送 Telegram 推送通知.
-# 3. 安装/管理一个交互式 Telegram Bot, 用于实时查询服务器状态.
-# =================================================================================
+# Description: This script monitors CPU, memory, disk usage, and network speed.
+#              It sends an alert to a Telegram bot if any metric exceeds
+#              predefined thresholds. It also supports scheduled reports.
+# Author: Gemini
+#================================================================================
 
-set -euo pipefail
+# --- Script Configuration ---
+CONFIG_FILE=~/.vps_monitor_config
 
-# --- 全局配置 ---
-readonly CONFIG_FILE="/etc/vps-monitor.conf"
-readonly BOT_PY_SCRIPT="/usr/local/bin/vps_bot.py"
-readonly BOT_SERVICE_FILE="/etc/systemd/system/vps-bot.service"
+# --- Helper Functions ---
 
-# 颜色定义
-readonly C_RESET='\033[0m'; readonly C_RED='\033[0;31m'; readonly C_GREEN='\033[0;32m'
-readonly C_YELLOW='\033[0;33m'; readonly C_CYAN='\033[0;36m'
-
-# Exporter 版本
-readonly NODE_EXPORTER_VERSION="1.8.1"
-readonly PROCESS_EXPORTER_VERSION="0.7.10"
-readonly BLACKBOX_EXPORTER_VERSION="0.25.0"
-
-# 全局变量
-TG_BOT_TOKEN=""
-TG_CHAT_ID=""
-HOST_IP=""
-HOST_NAME=""
-OS_ID=""
-ARCH=""
-
-# --- 日志与辅助函数 ---
-log_info() { echo -e "${C_GREEN}[INFO]${C_RESET} $1"; }
-log_warn() { echo -e "${C_YELLOW}[WARN]${C_RESET} $1"; }
-log_error() { echo -e "${C_RED}[ERROR]${C_RESET} $1" >&2; exit 1; }
-command_exists() { command -v "$1" >/dev/null 2>&1; }
-
-check_root() {
-    if [[ "$(id -u)" -ne 0 ]]; then
-        log_error "请使用 root 权限运行此脚本 (例如: sudo $0)。"
-    fi
-}
-
-get_host_info() {
-    HOST_NAME=$(hostname)
-    HOST_IP=$(curl -s4m 5 https://api.ipify.org || ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v "127.0.0.1" | head -n 1 || echo "N/A")
-}
-
-detect_os_arch() {
-    if [[ -f /etc/os-release ]]; then . /etc/os-release; OS_ID="${ID}"; else log_error "无法检测到操作系统。"; fi
-    case "$(uname -m)" in
-        x86_64) ARCH="amd64" ;;
-        aarch64) ARCH="arm64" ;;
-        *) log_error "不支持的系统架构: $(uname -m)" ;;
+# Function to display colored text
+print_color() {
+    case $1 in
+        "green") echo -e "\033[32m$2\033[0m" ;;
+        "red") echo -e "\033[31m$2\033[0m" ;;
+        "yellow") echo -e "\033[33m$2\033[0m" ;;
+        *) echo "$2" ;;
     esac
 }
 
-install_dependencies() {
-    log_info "检查并安装依赖..."
-    local pkgs=()
-    command_exists curl || pkgs+=("curl"); command_exists wget || pkgs+=("wget"); command_exists tar || pkgs+=("tar")
-    [[ "$1" == "bot" ]] && { command_exists python3 || pkgs+=("python3"); command_exists pip3 || pkgs+=("python3-pip"); }
+# --- Initial Setup ---
+setup() {
+    print_color "yellow" "欢迎使用VPS监控脚本安装向导。"
+    print_color "yellow" "请输入您的Telegram Bot信息和警报阈值。"
+    echo
 
-    if [[ ${#pkgs[@]} -gt 0 ]]; then
-        log_info "将要安装: ${pkgs[*]}"
-        if [[ "${OS_ID}" =~ (ubuntu|debian) ]]; then apt-get update -y && apt-get install -y "${pkgs[@]}";
-        elif [[ "${OS_ID}" =~ (centos|rhel|fedora|almalinux|rocky) ]]; then yum install -y "${pkgs[@]}";
-        else log_error "无法自动安装依赖，请手动安装: ${pkgs[*]}"; fi
-    else log_info "依赖已满足。"; fi
+    read -p "请输入您的Telegram Bot Token: " TELEGRAM_BOT_TOKEN
+    read -p "请输入您的Telegram Chat ID: " TELEGRAM_CHAT_ID
+    echo
+
+    print_color "yellow" "现在设置各项资源的警报阈值 (%)"
+    read -p "CPU使用率警报阈值 (例如: 80): " CPU_THRESHOLD
+    read -p "内存使用率警报阈值 (例如: 85): " MEM_THRESHOLD
+    read -p "硬盘使用率警报阈值 (例如: 90): " DISK_THRESHOLD
+
+    # 保存配置
+    echo "TELEGRAM_BOT_TOKEN='${TELEGRAM_BOT_TOKEN}'" > ${CONFIG_FILE}
+    echo "TELEGRAM_CHAT_ID='${TELEGRAM_CHAT_ID}'" >> ${CONFIG_FILE}
+    echo "CPU_THRESHOLD=${CPU_THRESHOLD}" >> ${CONFIG_FILE}
+    echo "MEM_THRESHOLD=${MEM_THRESHOLD}" >> ${CONFIG_FILE}
+    echo "DISK_THRESHOLD=${DISK_THRESHOLD}" >> ${CONFIG_FILE}
+
+    print_color "green" "\n配置已保存至 ${CONFIG_FILE}"
+    print_color "green" "安装完成！"
+    echo
+    print_color "yellow" "为了让脚本能够定时运行，您需要添加一个Cron任务。"
+    print_color "yellow" "例如，要每天的10点发送报告，请运行 'crontab -e' 并添加以下行:"
+    echo "0 10 * * * /bin/bash $(realpath "$0") report"
+    print_color "yellow" "要实时监控并在超限时立即报警，可以每5分钟运行一次:"
+    echo "*/5 * * * * /bin/bash $(realpath "$0") check"
+    echo
 }
 
-# --- Telegram 配置与通知 ---
-
-load_config() { if [[ -f "${CONFIG_FILE}" ]]; then source "${CONFIG_FILE}"; fi; }
-
-setup_telegram() {
-    echo -e "\n${C_CYAN}--- 配置 Telegram 通知 ---${C_RESET}"
-    if [[ -n "${TG_BOT_TOKEN}" ]]; then read -rp "已检测到现有配置，是否覆盖？[y/N]: " ovr; [[ ! "${ovr}" =~ ^[Yy]$ ]] && return 0; fi
-    read -rp "请输入你的 Bot Token: " token; read -rp "请输入你的 Chat ID: " chat_id
-    if [[ -n "$token" && -n "$chat_id" ]]; then
-        TG_BOT_TOKEN="$token"; TG_CHAT_ID="$chat_id"
-        { echo "TG_BOT_TOKEN=\"${TG_BOT_TOKEN}\""; echo "TG_CHAT_ID=\"${TG_CHAT_ID}\""; } > "${CONFIG_FILE}"; chmod 600 "${CONFIG_FILE}"
-        log_info "配置已保存到 ${CONFIG_FILE}"; send_telegram "🔔 <b>VPS Monitor 通知配置成功</b>%0A%0A主机: <code>${HOST_NAME}</code>%0AIP: <code>${HOST_IP}</code>"
-    else log_warn "输入为空，跳过配置。"; fi
-}
-
-send_telegram() {
-    [[ -n "${TG_BOT_TOKEN}" && -n "${TG_CHAT_ID}" ]] && curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" -d chat_id="${TG_CHAT_ID}" -d text="$1" -d parse_mode="HTML" >/dev/null 2>&1 || true
-}
-
-# --- Exporter 监控管理 ---
-
-install_monitor() {
-    log_info "=== 开始安装 Exporter 监控套件 ==="
-    install_dependencies "exporter"; setup_telegram
-    
-    install_exporter "prometheus/node_exporter" "node_exporter" "${NODE_EXPORTER_VERSION}" "node_exporter" ""
-    install_exporter "ncabatoff/process-exporter" "process-exporter" "${PROCESS_EXPORTER_VERSION}" "process-exporter" ""
-    install_exporter "prometheus/blackbox_exporter" "blackbox_exporter" "${BLACKBOX_EXPORTER_VERSION}" "blackbox_exporter" "--config.file=/etc/blackbox.yml"
-
-    cat > /etc/blackbox.yml << 'EOF'
-modules:
-  http_2xx:
-    prober: http
-    timeout: 5s
-EOF
-    systemctl restart blackbox_exporter
-
-    log_info "✅ 所有 Exporter 组件安装并启动成功！"
-    send_telegram "✅ <b>Exporter 监控安装成功</b>%0A%0A主机: <code>${HOST_NAME}</code>%0AIP: <code>${HOST_IP}</code>%0A状态: 所有服务运行中"
-}
-
-install_exporter() {
-    local repo_path="$1" name="$2" version="$3" binary_name="$4" args="${5:-}"
-    log_info "--- 正在安装 ${name} v${version} ---"
-    local url="https://github.com/${repo_path}/releases/download/v${version}/${name}-${version}.linux-${ARCH}.tar.gz"
-    local tmp_dir; tmp_dir=$(mktemp -d)
-    pushd "${tmp_dir}" >/dev/null
-
-    log_info "正在下载: ${url}"
-    if command_exists curl; then 
-        curl --fail -sSL -o "${name}.tar.gz" "${url}" || log_error "使用 curl 下载 ${name} 失败！请检查网络或 URL。"
-    else 
-        wget -q -O "${name}.tar.gz" "${url}" || log_error "使用 wget 下载 ${name} 失败！请检查网络或 URL。"
-    fi
-
-    log_info "正在解压文件..."
-    tar -xzf "${name}.tar.gz"
-    find . -name "${binary_name}" -type f -exec mv {} /usr/local/bin/ \;
-    chmod +x "/usr/local/bin/${binary_name}"
-
-    cat > "/etc/systemd/system/${binary_name}.service" << EOF
-[Unit]
-Description=${name}
-After=network-online.target
-[Service]
-User=root
-Restart=on-failure
-ExecStart=/usr/local/bin/${binary_name} ${args}
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload && systemctl enable "${binary_name}" && systemctl start "${binary_name}"
-    popd >/dev/null; rm -rf "${tmp_dir}"
-    log_info "${name} 安装成功。"
-}
-
-uninstall_monitor() {
-    log_info "=== 开始卸载所有 Exporter 监控组件 ==="
-    for svc in node_exporter process-exporter blackbox_exporter; do
-        systemctl stop "$svc" 2>/dev/null || true; systemctl disable "$svc" 2>/dev/null || true
-        rm -f "/etc/systemd/system/${svc}.service" "/usr/local/bin/${svc}"
-    done
-    rm -f /etc/blackbox.yml; systemctl daemon-reload
-    log_info "✅ 所有 Exporter 组件已卸载。"; send_telegram "🗑️ <b>Exporter 监控已卸载</b>%0A%0A主机: <code>${HOST_NAME}</code>%0AIP: <code>${HOST_IP}</code>"
-}
-
-restart_monitor() {
-    log_info "=== 正在重启所有 Exporter 监控服务 ==="
-    systemctl restart node_exporter process-exporter blackbox_exporter
-    log_info "✅ 所有 Exporter 服务已重启。"; send_telegram "🔄 <b>Exporter 监控服务已重启</b>%0A%0A主机: <code>${HOST_NAME}</code>%0AIP: <code>${HOST_IP}</code>"
-}
-
-# --- 交互式 Bot 管理 ---
-install_bot_service() {
-    log_info "=== 开始安装交互式 Telegram Bot 服务 ==="
-    if [[ ! -f "${CONFIG_FILE}" || -z "${TG_BOT_TOKEN}" ]]; then log_warn "未找到 Telegram 配置。请先配置。"; setup_telegram; [[ -z "${TG_BOT_TOKEN}" ]] && log_error "Telegram 配置失败，无法安装 Bot。"; fi
-    install_dependencies "bot"; log_info "正在安装/更新 Python 库: python-telegram-bot"; pip3 install "python-telegram-bot>=20.0" --upgrade
-
-    log_info "正在创建 Bot 脚本: ${BOT_PY_SCRIPT}"; cat > "${BOT_PY_SCRIPT}" << 'EOF'
-import os, subprocess, logging
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
-BOT_TOKEN, ALLOWED_CHAT_ID = os.getenv("VPS_BOT_TOKEN"), os.getenv("VPS_CHAT_ID")
-if not (BOT_TOKEN and ALLOWED_CHAT_ID): logger.error("环境变量 VPS_BOT_TOKEN 或 VPS_CHAT_ID 未设置!"); exit(1)
-try: admin_filter = filters.User(user_id=int(ALLOWED_CHAT_ID))
-except ValueError: logger.error("环境变量 VPS_CHAT_ID 不是一个有效的整数!"); exit(1)
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_html(f"👋 你好, {update.effective_user.mention_html()}!\n\n我是你的专属 VPS 状态监控机器人。\n\n<b>可用命令:</b>\n/status - 查看当前服务器状态")
-
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        hostname = subprocess.check_output("hostname", shell=True).decode("utf-8").strip()
-        uptime_output = subprocess.check_output("uptime", shell=True).decode("utf-8").strip()
-        mem_info = "\n".join(subprocess.check_output("free -h", shell=True).decode("utf-8").splitlines()[:2])
-        disk_info = subprocess.check_output("df -h /", shell=True).decode("utf-8").splitlines()[1]
-        message = (f"<b>📊 主机 <code>{hostname}</code> 状态报告</b>\n\n"
-                   f"<b>⏳ 系统负载与在线时间:</b>\n<pre>{uptime_output}</pre>\n"
-                   f"<b>💾 内存使用:</b>\n<pre>{mem_info}</pre>\n"
-                   f"<b>💽 磁盘空间 (/):</b>\n<pre>Filesystem      Size  Used Avail Use%\n{disk_info}</pre>")
-        await update.message.reply_html(message)
-    except Exception as e:
-        logger.error(f"执行 status 命令失败: {e}"); await update.message.reply_text("获取服务器状态时出错，请检查服务器日志。")
-
-async def unauthorized_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚫 你没有权限使用此机器人。")
-
-def main():
-    application = Application.builder().token(BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start_command, filters=admin_filter))
-    application.add_handler(CommandHandler("status", status_command, filters=admin_filter))
-    application.add_handler(MessageHandler(~admin_filter, unauthorized_handler))
-    logger.info("机器人启动，开始监听..."); application.run_polling()
-if __name__ == '__main__': main()
-EOF
-    chmod +x "${BOT_PY_SCRIPT}"
-
-    log_info "正在创建 systemd 服务: ${BOT_SERVICE_FILE}"; cat > "${BOT_SERVICE_FILE}" << EOF
-[Unit]
-Description=VPS Telegram Bot Service
-After=network.target
-[Service]
-Environment="VPS_BOT_TOKEN=${TG_BOT_TOKEN}"
-Environment="VPS_CHAT_ID=${TG_CHAT_ID}"
-Type=simple
-User=root
-ExecStart=/usr/bin/python3 ${BOT_PY_SCRIPT}
-Restart=on-failure
-RestartSec=10
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload && systemctl enable vps-bot.service && systemctl restart vps-bot.service
-    log_info "✅ 交互式 Bot 服务安装/更新成功并已启动！"; log_info "请在 Telegram 中向你的机器人发送 /status 命令进行测试。"
-}
-
-uninstall_bot_service() {
-    log_info "=== 正在卸载交互式 Bot 服务 ==="
-    systemctl stop vps-bot.service 2>/dev/null || true; systemctl disable vps-bot.service 2>/dev/null || true
-    rm -f "${BOT_SERVICE_FILE}" "${BOT_PY_SCRIPT}"; systemctl daemon-reload
-    log_info "✅ 交互式 Bot 服务已卸载。"
-}
-
-restart_bot_service() { log_info "=== 正在重启交互式 Bot 服务 ==="; systemctl restart vps-bot.service; log_info "✅ 交互式 Bot 服务已重启。"; }
-view_bot_logs() { log_info "=== 查看 Bot 服务日志 (按 Ctrl+C 退出) ==="; journalctl -u vps-bot.service -f -n 50; }
-
-# --- 主菜单与程序入口 ---
-show_menu() {
-    echo -e "\n${C_CYAN}========== VPS 监控与 Bot 统一管理脚本 ==========${C_RESET}"
-    echo -e "${C_YELLOW}--- Exporter 监控 ---${C_RESET}"
-    echo "  1. 安装 Exporter (Install Exporters)"; echo "  2. 卸载 Exporter (Uninstall Exporters)"; echo "  3. 重启 Exporter (Restart Exporters)"
-    echo -e "${C_YELLOW}--- 交互式 Bot ---${C_RESET}"
-    echo "  4. 安装/更新 Bot 服务 (Install/Update Bot Service)"; echo "  5. 卸载 Bot 服务 (Uninstall Bot Service)"
-    echo "  6. 重启 Bot 服务 (Restart Bot Service)"; echo "  7. 查看 Bot 日志 (View Bot Logs)"
-    echo -e "${C_YELLOW}--- 其他 ---${C_RESET}"
-    echo "  8. 重新配置 Telegram (Re-configure Telegram)"; echo "  9. 退出 (Exit)"
-    echo "----------------------------------------------------"
-    read -rp "请输入你的选择 [1-9]: " choice
-}
-
-main() {
-    check_root; detect_os_arch; get_host_info; load_config
-    if [[ $# -gt 0 ]]; then
-        case "$1" in
-            install) install_monitor ;; uninstall) uninstall_monitor ;; restart) restart_monitor ;;
-            install_bot) install_bot_service ;; uninstall_bot) uninstall_bot_service ;; restart_bot) restart_bot_service ;;
-            *) log_error "无效参数: $1。" ;;
-        esac
+# 加载配置
+load_config() {
+    if [ -f "${CONFIG_FILE}" ]; then
+        source "${CONFIG_FILE}"
     else
-        while true; do
-            show_menu
-            case "${choice}" in
-                1) install_monitor ;; 2) uninstall_monitor ;; 3) restart_monitor ;; 4) install_bot_service ;;
-                5) uninstall_bot_service ;; 6) restart_bot_service ;; 7) view_bot_logs ;; 8) setup_telegram ;;
-                9) echo "脚本已退出。"; exit 0 ;; *) log_warn "无效的选择，请重新输入。" ;;
-            esac
-            read -n 1 -s -r -p $'\n按任意键返回主菜单...'
-        done
+        print_color "red" "配置文件不存在！请先运行安装程序。"
+        setup
     fi
 }
 
-main "$@"
+# --- Monitoring Functions ---
+
+# 获取CPU使用率
+get_cpu_usage() {
+    CPU_USAGE=$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1}')
+    echo "${CPU_USAGE}"
+}
+
+# 获取内存使用率
+get_mem_usage() {
+    MEM_USAGE=$(free | grep Mem | awk '{print $3/$2 * 100.0}')
+    echo "${MEM_USAGE}"
+}
+
+# 获取硬盘使用率
+get_disk_usage() {
+    DISK_USAGE=$(df -h / | grep / | awk '{ print $5 }' | sed 's/%//g')
+    echo "${DISK_USAGE}"
+}
+
+# 获取网络速度 (KB/s)
+get_network_speed() {
+    INTERFACE=$(ip route | grep default | awk '{print $5}')
+    R1=$(cat /sys/class/net/${INTERFACE}/statistics/rx_bytes)
+    T1=$(cat /sys/class/net/${INTERFACE}/statistics/tx_bytes)
+    sleep 1
+    R2=$(cat /sys/class/net/${INTERFACE}/statistics/rx_bytes)
+    T2=$(cat /sys/class/net/${INTERFACE}/statistics/tx_bytes)
+    RX_SPEED=$(( (R2 - R1) / 1024 ))
+    TX_SPEED=$(( (T2 - T1) / 1024 ))
+    echo "下载: ${RX_SPEED} KB/s, 上传: ${TX_SPEED} KB/s"
+}
+
+
+# --- Telegram Bot Function ---
+
+# 发送消息到Telegram
+send_telegram_message() {
+    local MESSAGE_TEXT="$1"
+    # 使用-d参数并通过POST请求发送，以支持多行文本
+    curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+        -d chat_id="${TELEGRAM_CHAT_ID}" \
+        -d text="${MESSAGE_TEXT}" \
+        -d parse_mode="Markdown" > /dev/null
+}
+
+
+# --- Core Logic ---
+
+# 检查并发送警报
+check_and_alert() {
+    load_config
+
+    CPU=$(get_cpu_usage)
+    MEM=$(get_mem_usage)
+    DISK=$(get_disk_usage)
+    
+    ALERT_MESSAGE=""
+
+    # 比较浮点数
+    if (( $(echo "$CPU > $CPU_THRESHOLD" | bc -l) )); then
+        ALERT_MESSAGE+="*警告: CPU使用率过高!* \n"
+        ALERT_MESSAGE+="  - 当前: ${CPU}%\n"
+        ALERT_MESSAGE+="  - 阈值: ${CPU_THRESHOLD}%\n\n"
+    fi
+
+    if (( $(echo "$MEM > $MEM_THRESHOLD" | bc -l) )); then
+        ALERT_MESSAGE+="*警告: 内存使用率过高!* \n"
+        ALERT_MESSAGE+="  - 当前: ${MEM}%\n"
+        ALERT_MESSAGE+="  - 阈值: ${MEM_THRESHOLD}%\n\n"
+    fi
+
+    if [ "$DISK" -gt "$DISK_THRESHOLD" ]; then
+        ALERT_MESSAGE+="*警告: 硬盘使用率过高!* \n"
+        ALERT_MESSAGE+="  - 当前: ${DISK}%\n"
+        ALERT_MESSAGE+="  - 阈值: ${DISK_THRESHOLD}%\n\n"
+    fi
+
+    if [ -n "${ALERT_MESSAGE}" ]; then
+        HOSTNAME=$(hostname)
+        IP_ADDRESS=$(hostname -I | awk '{print $1}')
+        FINAL_MESSAGE="*VPS 状态警报: ${HOSTNAME} (${IP_ADDRESS})*\n\n${ALERT_MESSAGE}"
+        send_telegram_message "${FINAL_MESSAGE}"
+    fi
+}
+
+# 生成并发送报告
+send_report() {
+    load_config
+    
+    HOSTNAME=$(hostname)
+    IP_ADDRESS=$(hostname -I | awk '{print $1}')
+    CPU=$(get_cpu_usage)
+    MEM=$(get_mem_usage)
+    DISK=$(get_disk_usage)
+    NET_SPEED=$(get_network_speed)
+    UPTIME=$(uptime -p)
+
+    REPORT_MESSAGE="*VPS 状态报告: ${HOSTNAME} (${IP_ADDRESS})*\n\n"
+    REPORT_MESSAGE+="*系统运行时间:* ${UPTIME}\n"
+    REPORT_MESSAGE+="*CPU 使用率:* ${CPU}%\n"
+    REPORT_MESSAGE+="*内存 使用率:* ${MEM}%\n"
+    REPORT_MESSAGE+="*硬盘 使用率:* ${DISK}%\n"
+    REPORT_MESSAGE+="*当前网速:* ${NET_SPEED}\n"
+
+    send_telegram_message "${REPORT_MESSAGE}"
+}
+
+
+# --- Main Execution ---
+
+case "$1" in
+    "install")
+        setup
+        ;;
+    "check")
+        check_and_alert
+        ;;
+    "report")
+        send_report
+        ;;
+    *)
+        echo "用法: $0 {install|check|report}"
+        echo "  install: 初始化脚本配置。"
+        echo "  check:   检查各项指标，如果超过阈值则发送警报。"
+        echo "  report:  发送一份当前的系统状态报告。"
+        ;;
+esac
+
+exit 0
